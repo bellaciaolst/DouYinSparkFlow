@@ -4,7 +4,10 @@ name: 【dev（测试）分支】DouYin Spark Flow Schedule Run
 on:
   workflow_dispatch: # 允许手动触发
   schedule: # 定时任务
-    - cron: "0 1 * * *" # 每天 1:00 UTC（对应北京时间 9:00）
+    # 🎯 核心修改：每小时的第 25 分钟自动执行一次（例如 01:25, 02:25...）
+    # 故意错开 00 分整点，避开全球服务器拥堵，触发成功率最高
+    - cron: "25 */1 * * *"
+
 jobs:
   run-main:
     timeout-minutes: 20
@@ -13,32 +16,43 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: dev
+        ref: dev # 明确指定拉取 dev 分支的代码
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+
+    # 🎯 网站信息平替：将原本的创作者平台平替为你实际在用的抖音聊天页
+    # 用于在跑脚本前测试网络和抖音的可访问性
     - name: Test Douyin Accessibility
       run: |
-        curl -I https://creator.douyin.com/
+        curl -I https://www.douyin.com/chat
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+
     - name: Ensure browsers are installed
       run: playwright install chromium --with-deps --only-shell
+
     - name: Export Github Environment Variables and Secrets to JSON
       env:
         VARS_JSON: ${{ toJson(vars) }}
         SECRETS_JSON: ${{ toJson(secrets) }}
       run: python utils/export_github_env.py
+
     - name: Run DouYin Spark Flow
       run: python main.py
+
     - uses: actions/upload-artifact@v4
       if: ${{ !cancelled() }}
       with:
         name: run-logs
         path: logs/
+
+  # 自动保活工作流，防止仓库因为长期没提交代码而被 GitHub 暂停定时
   workflow-keepalive:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
