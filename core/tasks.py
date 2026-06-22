@@ -1,289 +1,75 @@
-import traceback
-from utils.logger import setup_logger
-from utils.config import get_config, get_userData
-from core.msg_builder import build_message, build_message_with_openai
-from core.browser import get_browser
-from playwright.sync_api import Response
-import time
-import json
-
-complates = {}
-
-config = get_config()
-userData = get_userData()
-logger = setup_logger(level=config.get("logLevel", "Info"))
-matchMode = config.get("matchMode", "nickname")
-userIDDict = {}
-
-def handle_response(response: Response):
-    """
-    只监听你要的那个接口响应
-    """
-    global userIDDict
-    # 精准匹配目标接口 URL
-    if "aweme/v1/creator/im/user_detail/" in response.url:
-        try:
-            # 获取接口返回的 JSON 数据
-            json_data = response.json()
-            for item in json_data.get("user_list", []):
-                short_id = item.get("user", {}).get("ShortId")
-                nickname = item.get("user", {}).get("nickname")
-                user_id = item.get("user_id", "")
-                userIDDict[str(short_id)] = {"nickname": nickname, "user_id": user_id}
-        except Exception as e:
-            tb = traceback.extract_tb(e.__traceback__)
-            last = tb[-1]
-            print(f"解析响应失败: {e}")
-            print(f"文件: {last.filename}, 行号: {last.lineno}, 函数: {last.name}")
-
-
-def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
-    """
-    通用的重试逻辑
-    """
-    for attempt in range(retries):
-        try:
-            return operation(*args, **kwargs)
-        except Exception as e:
-            if attempt < retries - 1:
-                logger.warning(f"{name} 失败，正在重试第 {attempt + 1} 次，错误：{e}")
-                time.sleep(delay)
-            else:
-                logger.error(f"{name} 失败，已达到最大重试次数，错误：{e}")
-                raise
-
-
-def scroll_and_select_user(page, username, targets):
-    """尝试滚动并查找用户名"""
-    # 定义目标元素和滚动容器的选择器
-    friends_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
-    target_selector = 'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]//div[contains(@class, "semi-list-item-body semi-list-item-body-flex-start")]'
-    scrollable_friends_selector = 'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]/div/div/div[3]/div/div/div/ul/div'
-    
-    # 使用模糊匹配 no-more-tip- 前缀，不再依赖精确哈希后缀
-    no_more_selector = 'xpath=//div[contains(@class, "no-more-tip-")]'
-    loading_selector = 'xpath=//div[contains(@class, "semi-spin")]'
-
-    logger.debug(f"账号 {username} 开始查找目标好友列表")
-    logger.debug(f"账号 {username} 目标好友列表: {targets}")
-
-    logger.debug(f"账号 {username} 点击进入好友标签页")
-    # 点击好友标签页
-    page.wait_for_selector(friends_tab_selector)
-    page.locator(friends_tab_selector).click()
-
-    logger.debug(f"账号 {username} 进入好友列表页面")
-
-    # 确保第一个好友元素加载完成
-    first_friend_selector = 'xpath=//*[@id="sub-app"]/div/div/div[2]/div[2]/div/div/div[1]/div/div/div/ul/div/div/div[1]/li/div'
-    page.wait_for_selector(first_friend_selector)
-    page.locator(first_friend_selector).click()  # 点击第一个好友，确保列表激活
-
-    logger.debug(f"账号 {username} 已激活好友列表，开始滚动查找目标好友")
-
-    time.sleep(config["friendListTimeout"] / 1000)  # 等待好友列表加载
-
-    found_targets = set()
-    # 复制一份目标列表用于追踪进度
-    remaining_targets = set(targets)
-
-    # 新增：连续空滚动计数器（滚动后没有发现新好友的次数）
-    empty_scroll_count = 0
-    MAX_EMPTY_SCROLLS = 10  # 连续10次滚动没有新好友，认为到底了
-
-    while True:
-        # 查找所有目标元素
-        target_elements = page.locator(target_selector).all()
-
-        # 记录本轮循环前已发现的好友数，用于判断是否有新发现
-        prev_found_count = len(found_targets)
-
-        for element in target_elements:
-            try:
-                # 查找子元素 span，模糊匹配 class
-                span = element.locator(
-                    """xpath=.//span[contains(@class, "item-header-name-")]"""
-                )
-                targetName = span.inner_text()
-
-                if targetName in found_targets:
-                    continue  # 已处理过，跳过
-                found_targets.add(targetName)
-
-                logger.debug(f"账号 {username} 找到好友 {targetName}")
-                # 检查是否是目标用户名
-                if matchMode == "short_id":
-                    targetSymbol = next((sid for sid, info in userIDDict.items() if info.get("nickname") == targetName), None)
-                else:
-                    targetSymbol = targetName
-
-                if targetSymbol in targets:
-                    element.click()
-                    if matchMode == "short_id":
-                        logger.debug(
-                            f"账号 {username} 选中目标好友 {targetName} 准备开始交互"
-                        )
-                    else:
-                        logger.debug(
-                            f"账号 {username} 选中目标好友 {targetName} (ShortId: {targetSymbol}) 准备开始交互"
-                        )
-                    yield targetName
-                    
-                    # 标记已找到，如果全找到了直接退出
-                    if targetSymbol in remaining_targets:
-                        remaining_targets.remove(targetSymbol)
-                    if len(remaining_targets) == 0:
-                        logger.debug(f"账号 {username} 所有目标好友均已找到，停止搜索")
-                        return
-                    break
-            except Exception as e:
-                traceback.print_exc()
-        else:
-            # 检查本轮是否有新好友被发现
-            new_found = len(found_targets) > prev_found_count
-            if new_found:
-                empty_scroll_count = 0  # 有新发现，重置计数器
-            else:
-                empty_scroll_count += 1  # 无新发现，递增计数器
-
-            # 状态检测逻辑（多重兜底）
-            
-            # 1. 检查是否到底（"没有更多了" —— 使用模糊类名匹配）
-            if page.locator(no_more_selector).count() > 0:
-                logger.info(f"账号 {username} 检测到'没有更多了'标志，已到达底部")
-                if len(remaining_targets) > 0:
-                    logger.warning(f"账号 {username} 搜索结束，仍有以下好友未找到: {remaining_targets}")
-                break
-
-            # 2. 检查连续空滚动次数，防止死循环
-            if empty_scroll_count >= MAX_EMPTY_SCROLLS:
-                logger.warning(f"账号 {username} 连续 {MAX_EMPTY_SCROLLS} 次滚动未发现新好友，判定已到达底部")
-                if len(remaining_targets) > 0:
-                    logger.warning(f"账号 {username} 搜索结束，仍有以下好友未找到: {remaining_targets}")
-                break
-
-            # 3. 检查是否正在加载
-            if page.locator(loading_selector).count() > 0:
-                logger.debug(f"账号 {username} 列表正在加载中 (Loading)...")
-                time.sleep(1.5) # 给加载留点时间
-
-            # 4. 滚动容器
-            scrollable_element = page.locator(
-                scrollable_friends_selector
-            ).element_handle()
-            
-            if scrollable_element:
-                # 记录滚动前的 scrollTop，用于检测是否真的滚动了
-                scroll_top_before = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-                
-                page.evaluate(
-                    "(element) => element.scrollTop += 800", scrollable_element
-                )
-                
-                # 检测滚动后的 scrollTop
-                time.sleep(0.3)
-                scroll_top_after = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-                
-                if scroll_top_before == scroll_top_after:
-                    # scrollTop 没有变化，说明已经到底了
-                    empty_scroll_count += 2  # 加速判定到底
-                    logger.debug(f"账号 {username} scrollTop 未变化 ({scroll_top_before})，可能已到底 (空滚动计数: {empty_scroll_count}/{MAX_EMPTY_SCROLLS})")
-                else:
-                    logger.debug(f"账号 {username} 滚动好友列表以加载更多好友 (scrollTop: {scroll_top_before} -> {scroll_top_after})")
-                
-                time.sleep(1.5)
-            else:
-                logger.error(f"账号 {username} 未找到滚动容器，退出")
-                break
-
-
 def do_user_task(browser, username, cookies, targets):
     context = browser.new_context()  # 每个任务使用独立的上下文
-    context.set_default_navigation_timeout(config["browserTimeout"])  # 设置导航超时时间
-    context.set_default_timeout(config["browserTimeout"])  # 设置所有操作的默认超时时间
+    
+    # 💡 强力降噪：针对 GitHub Actions 云端运行，单独把元素查找超时缩短到 15 秒
+    # 这样就算卡住了，也会在 15 秒内报错弹出来，而不是死等 2 分钟
+    context.set_default_navigation_timeout(config["browserTimeout"])  # 导航超时仍可保持较长
+    context.set_default_timeout(15000)  # 查找元素超过 15 秒直接报错，防止死等挂起
 
     page = context.new_page()
     
     if matchMode == "short_id":  # 使用抖音号进行匹配
         page.on("response", handle_response)
     
-    # 💡 优化 1：先注入 Cookie，再访问网站，防止在 Actions 云端被反爬拦截或卡在登录页
+    # 1. 必须先注入 Cookie 
     context.add_cookies(cookies)
 
-    # 打开抖音创作者中心
-    retry_operation(
-        "打开抖音创作者中心",
-        page.goto,
-        retries=config["taskRetryTimes"],
-        delay=5,
-        url="https://creator.douyin.com/",
-    )
-
-    # 导航到消息页面
-    retry_operation(
-        "导航到消息页面",
-        page.goto,
-        retries=config["taskRetryTimes"],
-        delay=5,
-        url="https://creator.douyin.com/creator-micro/data/following/chat",
-    )
-
-    logger.debug(f"账号 {username} 开始发送消息")
-    
-    # 💡 核心修复 2：将循环变量 username 改为 target_username，防止污染外部函数传入的当前登录账号变量
-    for target_username in scroll_and_select_user(page, username, targets):
-        logger.debug(f"账号 {username} 已选中好友 {target_username} 发送消息")
-        
-        # 等待聊天输入框元素加载完成
-        chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
-        page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
-        chat_input = page.locator(chat_input_selector)
-
-        # 输入内容
-        message = build_message()
-        message_lines = message.split("\\n")
-        for line in message_lines:
-            chat_input.type(line)  # 输入每一行
-            # 如果不是最后一行，模拟 Shift+Enter 插入换行
-            if line != message_lines[-1]:
-                chat_input.press("Shift+Enter")
-
-        logger.debug(
-            f"账号 {username} 准备发送消息给好友 {target_username}：\n\t{message}"
-        )
-        
-        # 模拟按下回车键发送消息
-        chat_input.press("Enter")
-        logger.debug(f"账号 {username} 给好友 {target_username} 发送消息完成")
-        time.sleep(2)  # 发送完等待一会儿
-
-    context.close()  # 任务完成后关闭上下文
-
-
-def runTasks():
-    playwright, browser = get_browser()
+    # 2. 🎯 核心抗卡死修改：放弃打开创作者中心首页，直接一步到位去聊天消息页面！
+    # 首页含有大量反爬、滑块和重定向逻辑，在 Actions 的 headless 环境中极易永久卡死
+    logger.info(f"账号 {username} 正在直接跨越到消息页面...")
     try:
-        logger.info("开始执行任务")
-        logger.debug(f"当前配置如下：")
-        logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
-        logger.debug(f"一言类型: {config['hitokotoTypes']}")
-        for user in userData:
-            logger.debug(f"用户: {user.get('username', '未知用户')}, 目标好友: {user['targets']}")
+        page.goto(
+            "https://creator.douyin.com/creator-micro/data/following/chat",
+            wait_until="commit", # 💡 只要服务器响应了就立刻继续，不等垃圾静态资源加载完毕，防卡死
+            timeout=45000
+        )
+    except Exception as e:
+        logger.warning(f"账号 {username} 页面加载未完全结束（可能在等冗余资源），尝试继续：{e}")
 
-        for user in userData:
-            cookies = user["cookies"]
-            targets = user["targets"]
-            complates[user["unique_id"]] = []  # 初始化该用户的已完成列表
-            username = user.get("username", "未知用户")
-            logger.info(f"开始处理账号 {username}")
-            # 创建任务
-            do_user_task(browser, username, cookies, targets)
-            logger.info(f"账号 {username} 任务完成")
+    # 给页面 DOM 渲染留 5 秒死权重缓冲
+    time.sleep(5)
+
+    logger.debug(f"账号 {username} 开始发送消息流")
+    
+    try:
+        # 滚动并选择用户
+        for target_username in scroll_and_select_user(page, username, targets):
+            logger.debug(f"账号 {username} 已选中好友 {target_username} 发送消息")
+            
+            # 等待聊天输入框元素加载完成
+            chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
+            page.wait_for_selector(chat_input_selector, timeout=10000)
+            chat_input = page.locator(chat_input_selector)
+
+            # 输入内容
+            message = build_message()
+            message_lines = message.split("\\n")
+            for line in message_lines:
+                chat_input.type(line)  # 输入每一行
+                if line != message_lines[-1]:
+                    chat_input.press("Shift+Enter")
+
+            logger.debug(
+                f"账号 {username} 准备发送消息给好友 {target_username}：\n\t{message}"
+            )
+            
+            # 模拟按下回车键发送消息
+            chat_input.press("Enter")
+            logger.debug(f"账号 {username} 给好友 {target_username} 发送消息完成")
+            time.sleep(2)  # 发送完等待一会儿
+            
+    except Exception as e:
+        # 💡 如果卡死在某一步导致失败，立刻保存一张当前网页的截图到 logs 目录！
+        # 这样你在 GitHub 的 artifacts 下载日志包，就能一眼看到当时浏览器里到底是卡在什么画面了（比如是不是弹滑块了）
+        import os
+        os.makedirs("logs", exist_ok=True)
+        screenshot_path = f"logs/{username}_error.png"
+        try:
+            page.screenshot(path=screenshot_path)
+            logger.error(f"❌ 运行中遭遇异常，已自动保存错误截图至: {screenshot_path}。错误详情: {e}")
+        except:
+            logger.error(f"❌ 运行中遭遇异常，且无法截屏。错误详情: {e}")
+        raise e # 重新抛出，让这一轮任务正常终止，而不是挂起
+
     finally:
-        # 关闭浏览器实例
-        browser.close()
-        playwright.stop()
+        context.close()  # 任务完成后关闭上下文
